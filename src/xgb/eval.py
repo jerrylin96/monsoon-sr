@@ -2,14 +2,12 @@
 
 import os
 import json
-import torch
 import logging
 import argparse
 import warnings
 import numpy as np
 import xarray as xr
-from model import NNModel
-from torch.utils.data import TensorDataset,DataLoader
+from model import XGBModel
 
 logging.basicConfig(level=logging.INFO,format='%(asctime)s - %(levelname)s - %(message)s',datefmt='%Y-%m-%d %H:%M:%S')
 logger = logging.getLogger(__name__)
@@ -25,12 +23,11 @@ LANDVAR     = CONFIGS['dataparams']['landvar']
 BATCHSIZE   = CONFIGS['evalparams']['batchsize']
 EXPERIMENTS = CONFIGS['experiments']
 RUNS        = CONFIGS['runs']
-
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+TRAINPARAMS = CONFIGS['trainparams']
 
 def reshape(da):
     '''
-    Purpose: Convert an xr.DataArray into a 2D NumPy array suitable for NN I/O.
+    Purpose: Convert an xr.DataArray into a 2D NumPy array suitable for model I/O.
     Args:
     - da (xr.DataArray): 3D or 4D DataArray
     Returns:
@@ -41,10 +38,10 @@ def reshape(da):
     else:
         arr = da.transpose('time','lat','lon').values.reshape(-1,1)
     return arr
-    
+
 def load(splitname,inputvars,uself,landvar=LANDVAR,targetvar=TARGETVAR,filedir=FILEDIR):
     '''
-    Purpose: Load in a normalized training or validation split and build a 2D feature matrix for the NN. 
+    Purpose: Load in a normalized training or validation split and build a 2D feature matrix.
     Args:
     - splitname (str): 'norm_valid' | 'norm_test'
     - inputvars (list[str]): list of input variables
@@ -53,7 +50,7 @@ def load(splitname,inputvars,uself,landvar=LANDVAR,targetvar=TARGETVAR,filedir=F
     - targetvar (str): target variable name (defaults to TARGETVAR)
     - filedir (str): directory containing split files (defaults to FILEDIR)
     Returns:
-    - tuple[torch.FloatTensor,xr.DataArray]: 2D input tensor and target DataArray (for reshaping predictions)
+    - tuple[np.ndarray,xr.DataArray]: 2D input array and target DataArray (for reshaping predictions)
     '''
     if splitname not in ('norm_valid','norm_test'):
         raise ValueError('Splitname must be `norm_valid` or `norm_test`.')
@@ -67,31 +64,33 @@ def load(splitname,inputvars,uself,landvar=LANDVAR,targetvar=TARGETVAR,filedir=F
     if uself:
         Xlist.append(reshape(ds[landvar]))
     X = np.concatenate(Xlist,axis=1) if len(Xlist)>1 else Xlist[0]
-    X = torch.tensor(X,dtype=torch.float32)
     ytemplate = ds[targetvar]
     return X,ytemplate
 
-def fetch(runname,inputsize,device=DEVICE,modeldir=MODELDIR):
+def fetch(runname,objective='reg:squarederror',modeldir=MODELDIR):
     '''
-    Purpose: Rebuild a trained NN model.
+    Purpose: Rebuild a trained XGBoost model.
     Args:
     - runname (str): model run name
-    - inputsize (int): number of input features to initialize NNModel
-    - device (str): 'cuda' or 'cpu' device for model evaluation (defaults to DEVICE)
+    - objective (str): objective function used during training
     - modeldir (str): directory with saved models (defaults to MODELDIR)
     Returns:
-    - NNModel: model on 'device' with loaded state_dict (weights)
+    - XGBModel: model with loaded weights
     '''
-    filename = f'nn_{runname}.pth'
+    filename = f'xgb_{runname}.json'
     filepath = os.path.join(modeldir,filename)
-    model = NNModel(inputsize).to(device)
-    state = torch.load(filepath,map_location=device)
-    model.load_state_dict(state)
+
+    # Reconstruct model parameters
+    model_params = {k:v for k,v in TRAINPARAMS.items() if k not in ['early_stopping_rounds']}
+    model_params['objective'] = objective
+
+    model = XGBModel(**model_params)
+    model.load(filepath)
     return model
 
 def denormalize(ynormflat,targetvar=TARGETVAR,filedir=FILEDIR):
     '''
-    Purpose: Convert normalized precipitation predictions back to physical units by undoing z-score normalization and log1p transformation. 
+    Purpose: Convert normalized precipitation predictions back to physical units by undoing z-score normalization and log1p transformation.
     Args:
     - ynormflat (np.ndarray): vector of normalized predictions
     - targetvar (str): target variable name (defaults to TARGETVAR)
@@ -107,31 +106,31 @@ def denormalize(ynormflat,targetvar=TARGETVAR,filedir=FILEDIR):
     y = np.expm1(ylog)
     return y
 
-def predict(model,X,ytemplate,batchsize=BATCHSIZE,device=DEVICE):
+def predict(model,X,ytemplate,batchsize=BATCHSIZE):
     '''
-    Purpose: Run the NN forward pass in batches and return precipitation predictions as an xr.DataArray.
+    Purpose: Run XGBoost prediction in batches and return precipitation predictions as an xr.DataArray.
     Args:
-    - model (NNModel): trained/loaded NN model
-    - X (torch.Tensor): 2D input tensor
+    - model (XGBModel): trained/loaded XGBoost model
+    - X (np.ndarray): 2D input array
     - ytemplate (xr.DataArray): template with dimension/coordinates to reshape predictions
     - batchsize (int): inference batch size (defaults to BATCHSIZE)
-    - device (str): 'cuda' or 'cpu' device for model evaluation (defaults to DEVICE)
     Returns:
-    - xr.DataArray: 3D DataArray of predicted precipitation 
+    - xr.DataArray: 3D DataArray of predicted precipitation
     '''
-    evaldataset = TensorDataset(X)
-    evalloader  = DataLoader(evaldataset,batch_size=batchsize,shuffle=False,pin_memory=True)
+    n_samples = X.shape[0]
     ypredlist = []
-    model.eval()
-    with torch.no_grad():
-        for (Xbatch,) in evalloader:
-            Xbatch = Xbatch.to(device,non_blocking=True)
-            ybatchpred = model(Xbatch)
-            ypredlist.append(ybatchpred.squeeze(-1).cpu().numpy())
+
+    # Process in batches to avoid memory issues
+    for i in range(0,n_samples,batchsize):
+        end_idx = min(i+batchsize,n_samples)
+        Xbatch = X[i:end_idx]
+        ybatchpred = model.predict(Xbatch)
+        ypredlist.append(ybatchpred)
+
     ynormflat = np.concatenate(ypredlist,axis=0)
     ypredflat = denormalize(ynormflat)
     da = xr.DataArray(ypredflat.reshape(ytemplate.shape),dims=ytemplate.dims,coords=ytemplate.coords,name='predpr')
-    da.attrs = dict(long_name='NN-predicted precipitation',units='mm/hr')
+    da.attrs = dict(long_name='XGBoost-predicted precipitation',units='mm/hr')
     return da
 
 def save(ypred,runname,splitname,resultsdir=RESULTSDIR):
@@ -146,7 +145,7 @@ def save(ypred,runname,splitname,resultsdir=RESULTSDIR):
     - bool: True if writing and verification succeed, otherwise False
     '''
     os.makedirs(resultsdir,exist_ok=True)
-    filename = f'nn_{runname}_{splitname}_pr.nc'
+    filename = f'xgb_{runname}_{splitname}_pr.nc'
     filepath = os.path.join(resultsdir,filename)
     logger.info(f'Attempting to save {filename}...')
     try:
@@ -160,24 +159,24 @@ def save(ypred,runname,splitname,resultsdir=RESULTSDIR):
         return False
 
 if __name__=='__main__':
-    parser = argparse.ArgumentParser(description='Evaluate NN models on a chosen split.')
+    parser = argparse.ArgumentParser(description='Evaluate XGBoost models on a chosen split.')
     parser.add_argument('--split',required=True,choices=['norm_valid','norm_test'],help='Which split to evaluate: `norm_valid` or `norm_test`.')
     args = parser.parse_args()
     try:
         explookup = {experiment['exp_name']:experiment for experiment in EXPERIMENTS}
-        logger.info(f'Evaluating NN models on {args.split} set...')
+        logger.info(f'Evaluating XGBoost models on {args.split} set...')
         for run in RUNS:
-            runname  = run['run_name']
-            expname  = run['exp_name']
-            uself    = run['use_lf']
-            loss     = run['loss']
+            runname   = run['run_name']
+            expname   = run['exp_name']
+            uself     = run['use_lf']
+            objective = run['objective']
             exp         = explookup[expname]
             inputvars   = exp['input_vars']
             description = exp['description']
             lfstr       = 'with' if uself else 'without'
-            logger.info(f'   Evaluating {description} {lfstr} land fraction using {loss.upper()} loss')
+            logger.info(f'   Evaluating {description} {lfstr} land fraction using {objective} objective')
             X,ytemplate = load(args.split,inputvars,uself)
-            model = fetch(runname,X.shape[1])
+            model = fetch(runname,objective)
             ypred = predict(model,X,ytemplate)
             save(ypred,runname,args.split)
             del X,ytemplate,model,ypred
